@@ -1,6 +1,7 @@
 from .node import Node, Argument, Target, map_arg
 
-from typing import Callable, Any, List, Dict, Optional, Tuple, Set
+from typing import Callable, Any, List, Dict, Optional, Tuple, Set, Union
+from torch.package._mangling import demangle as _demangle
 import builtins
 import torch
 import types
@@ -54,8 +55,13 @@ def _get_print_name(qualname: str) -> str:
         return qualname
     return qualname.rpartition('.')[2]
 
+# Representation of module dependencies.
+# str -> 'import str'
+# (str1, str2) -> 'from str1 import str2'
+_Import = Union[str, Tuple[str, str]]
 
-def _get_import_str(qualname: str) -> Optional[str]:
+
+def _get_import(qualname: str) -> Optional[_Import]:
     """
     Encodes the following import rule:
     - 'torch' is always imported as a base name (e.g. 'import torch').
@@ -67,14 +73,23 @@ def _get_import_str(qualname: str) -> Optional[str]:
     """
     base_module_name = qualname.partition('.')[0]
     if base_module_name == 'torch' or base_module_name == 'typing':
-        return f'import {base_module_name}'
+        return base_module_name
 
     module_name, _sep, type_name = qualname.rpartition('.')
     if len(module_name) == 0:
         # This was a single-atom qualified name, like 'getattr', or 'len'
         return None
 
-    return f'from {module_name} import {type_name}'
+    return module_name, type_name
+
+
+def _format_import(import_: _Import):
+    if isinstance(import_, str):
+        return f'import {import_}'
+    elif isinstance(import_, tuple):
+        return f'from {import_[0]} import {import_[1]}'
+    else:
+        raise AssertionError(f'unexpected type: {type(import_)}')
 
 
 # this is fixed on master, WAR for 1.5
@@ -210,6 +225,7 @@ class Graph:
         self._used_names : Dict[str, int] = {}  # base name -> number
         self._insert = self._root.prepend
         self._len = 0
+        self._imports : Set[_Import] = set()
 
     @property
     def nodes(self) -> _node_list:
@@ -649,7 +665,6 @@ class Graph:
                 type_repr(sub_type)
             return typename
 
-
         # Run through reverse nodes and record the first instance of a use
         # of a given node. This represents the *last* use of the node in the
         # execution order of the program, which we will use to free unused
@@ -740,15 +755,37 @@ class Graph:
             emit_node(node)
             delete_unused_values(node)
 
-        # repr() for inf and nan floating point values aren't parseable by
-        # python as literals. Explicitly import the names from the ``math`` module.
-        import_strs: Set[str] = set()
-        for qualname in qualnames_used:
-            import_str = _get_import_str(qualname)
-            if import_str is not None:
-                import_strs.add(import_str)
+        # Handle imports
+        #
+        # First, demangle qualified names. Types may have been retrieved from a
+        # torch.package, which means its typename will be mangled, e.g.
+        # '<torch_package_0>.foo.bar'. Demangle it, and additionally detect any
+        # potential collisions, like with an already existing 'foo.bar'. See
+        # torch/package/mangling.md for more information.
 
-        import_block = '\n'.join(sorted(import_strs))
+        # demangled name -> original name
+        # This is to detect collisions.
+        demangled_names: Dict[str, str] = {}
+
+        def demangle(name):
+            demangled = _demangle(name)
+            if name not in demangled_names:
+                demangled_names[demangled] = name
+            if demangled_names[demangled] != name:
+                raise RuntimeError("Encountered ambiguous types: "
+                                   f"'{name}' and '{demangled_names[name]}'.\n"
+                                   "This happens if you traced a module that contains "
+                                   "both code that you defined and code from a torch.package.")
+            return demangled
+
+        qualnames_used = {demangle(name) for name in qualnames_used}
+        self._imports = set()
+        for qualname in qualnames_used:
+            import_ = _get_import(qualname)
+            if import_ is not None:
+                self._imports.add(import_)
+
+        import_block = '\n'.join(sorted([_format_import(i) for i in self._imports]))
 
         if len(body) == 0:
             # If the Graph has no non-placeholder nodes, no lines for the body
